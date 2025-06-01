@@ -56,7 +56,7 @@ optional = true
 
 [tool.poetry.group.style.dependencies]
 # static: flake8 (style), mypy (typing), with type stubs for some libraries
-# autoformatter: p (style), isort (import sort)
+# autoformatter: black (style), isort (import sort)
 # pre-commit: tool to configure and install pre-commit hooks
 flake8 = "*"
 mypy = "*"
