@@ -1,4 +1,5 @@
 import logging
+import re
 import shutil
 from datetime import datetime
 from itertools import cycle
@@ -6,6 +7,7 @@ from pathlib import Path
 from re import match
 from typing import Dict, Generator, List
 from zipfile import BadZipFile, ZipFile
+from urllib.parse import unquote, quote
 
 import psutil
 import requests
@@ -26,8 +28,10 @@ from .data_handlers import clean_forecast_csv
 from .query import (
     Query,
     _construct_sqlloader_filename,
+    _construct_new_sqlloader_filename,
     _enumerate_tables,
     generate_sqlloader_filenames,
+    _use_new_filename_format,
 )
 
 logger = logging.getLogger(__name__)
@@ -166,19 +170,28 @@ def _construct_sqlloader_forecastdata_url(
         year: Year
         month: Month
         forecast_type: One of :data:`nemseer.forecast_types`
+        table: Table name (may include #FILE## suffix for new format)
     Returns:
         URL to zip file
     """
+
     if (
         forecast_type == "PREDISPATCH"
-        and (table_basename := match(r"([A-Z_]*)[0-9]?", table))
+        and (table_basename := match(r"([A-Z_]*)(?:#FILE\d+)?", table))
         and table_basename.group(1) in PREDISP_ALL_DATA
     ):
         data_url = _construct_yearmonth_url(year, month, forecast_type, all_data=True)
     else:
         data_url = _construct_yearmonth_url(year, month, forecast_type)
-    fn = _construct_sqlloader_filename(year, month, forecast_type, table)
-    url = data_url + fn + ".zip"
+
+    if _use_new_filename_format(year, month):
+        fn = _construct_new_sqlloader_filename(year, month, forecast_type, table)
+    else:
+        fn = _construct_sqlloader_filename(year, month, forecast_type, table)
+
+    # URL encode the filename to handle # characters properly
+    encoded_fn = quote(fn, safe="")
+    url = data_url + encoded_fn + ".zip"
     return url
 
 
@@ -189,9 +202,7 @@ def _get_captured_group_from_links(url: str, regex: str) -> List[str]:
     associated with a particular `forecast_type`. Primarily used to obtain table names.
 
     Args:
-        year: Year
-        month: Month
-        forecast_type: One of :data:`nemseer.forecast_types`
+        url: URL to scrape
         regex: Regular expression pattern, with one group capture
     Returns:
         A list of unique captured groups (one for each link on the page of tables)
@@ -199,10 +210,81 @@ def _get_captured_group_from_links(url: str, regex: str) -> List[str]:
     soup = _rerequest_to_obtain_soup(url, next(_build_useragent_generator(1)))
     links = [link.get("href") for link in soup.find_all("a")]
     tables = []
+
     for link in links:
-        if mo := match(regex, link):
-            tables.append(mo.group(1).lstrip("_"))
+        decoded_link = unquote(link)
+        if mo := match(regex, decoded_link):
+            table = mo.group(1) or mo.group(2)
+            tables.append(table.lstrip("_"))
     return list(set(tables))
+
+
+def _discover_table_files(
+    year: int, month: int, forecast_type: str, base_table: str
+) -> List[str]:
+    """Discovers all file parts for a given table in the new format.
+
+    For the new format, tables may be split into multiple files with #FILE## suffixes.
+    This function discovers all available file parts for a base table.
+
+    Args:
+        year: Year
+        month: Month
+        forecast_type: One of nemseer.forecast_types
+        base_table: Base table name (without #FILE## suffix)
+    Returns:
+        List of complete table names including #FILE## suffixes
+    """
+    if not _use_new_filename_format(year, month):
+        # For old format, return the base table as-is
+        return [base_table]
+
+    data_url = _construct_yearmonth_url(year, month, forecast_type)
+
+    # Handle PREDISPATCH ALL_DATA special case
+    if (
+        forecast_type == "PREDISPATCH"
+        and (table_basename := match(r"([A-Z_]*)", base_table))
+        and table_basename.group(1) in PREDISP_ALL_DATA
+    ):
+        predisp_all_url = _construct_yearmonth_url(
+            year, month, forecast_type, all_data=True
+        )
+        urls_to_check = [data_url, predisp_all_url]
+    else:
+        urls_to_check = [data_url]
+
+    all_table_files = []
+
+    for url in urls_to_check:
+        # Pattern to match files for this specific base table
+        if forecast_type == "PREDISPATCH" and base_table != "MNSPBIDTRK":
+            # No underscore for PREDISPATCH (except MNSPBIDTRK)
+            table_file_pattern = (
+                rf".*PUBLIC_ARCHIVE#{forecast_type}{base_table}#FILE(\d+)#\d+\.zip"
+            )
+        else:
+            # With underscore for other cases
+            table_file_pattern = (
+                rf".*PUBLIC_ARCHIVE#{forecast_type}_{base_table}#FILE(\d+)#\d+\.zip"
+            )
+
+        soup = _rerequest_to_obtain_soup(url, next(_build_useragent_generator(1)))
+        links = [link.get("href") for link in soup.find_all("a")]
+
+        for link in links:
+            decoded_link = unquote(link)
+            if mo := match(table_file_pattern, decoded_link):
+                file_num = mo.group(1)
+                table_with_file = f"{base_table}#FILE{file_num.zfill(2)}"
+                all_table_files.append(table_with_file)
+
+    # If no files found with #FILE## pattern, return base table
+    # (might be a single-file table in new format)
+    if not all_table_files:
+        return [base_table]
+
+    return sorted(list(set(all_table_files)))
 
 
 def get_sqlloader_forecast_tables(
@@ -231,12 +313,37 @@ def get_sqlloader_forecast_tables(
         List of tables associated with that forecast type for that period
     """
     _validate_forecast_type(forecast_type)
-    if actual:
-        table_capture = f".*/PUBLIC_DVD_{forecast_type}([A-Z_0-9]*)_[0-9]*.zip"
+
+    if _use_new_filename_format(year, month):
+        # New format regex patterns
+        if actual:
+            table_capture = (
+                rf".*PUBLIC_ARCHIVE#{forecast_type}_?([A-Z_]+)(?:#FILE\d+)?#\d+\.zip"
+            )
+        else:
+            table_capture = (
+                rf".*PUBLIC_ARCHIVE#{forecast_type}_?([A-Z_]+)(?:#FILE\d+)?#\d+\.zip"
+            )
     else:
-        table_capture = f".*/PUBLIC_DVD_{forecast_type}([A-Z_]*)[0-9]?_[0-9]*.zip"
+        # Old format regex patterns
+        if actual:
+            table_capture = (
+                rf".*/PUBLIC_(?:"
+                rf"DVD_{forecast_type}([A-Z_0-9]*)_\d+"
+                rf"|ARCHIVE#{forecast_type}([A-Z_0-9]+#FILE\d{{2}})#\d+"
+                rf")\.zip"
+            )
+        else:
+            table_capture = (
+                rf".*/PUBLIC_("
+                rf"?:DVD_{forecast_type}([A-Z_]+)[0-9]?_\d+"
+                rf"|ARCHIVE#{forecast_type}([A-Z_]+#FILE\d{{2}})#\d+"
+                rf")\.zip"
+            )
+
     data_url = _construct_yearmonth_url(year, month, forecast_type)
     tables = _get_captured_group_from_links(data_url, table_capture)
+
     if forecast_type == "PREDISPATCH":
         predisp_all_url = _construct_yearmonth_url(
             year, month, forecast_type, all_data=True
@@ -245,7 +352,19 @@ def get_sqlloader_forecast_tables(
             predisp_all_url, table_capture
         )
         tables.extend(predisp_all_tables)
-    return sorted(tables)
+
+    # Remove duplicates and get unique base tables
+    unique_base_tables = sorted(list(set(tables)))
+
+    # For new format, expand base tables to include all FILE# parts
+    if _use_new_filename_format(year, month):
+        expanded_tables = []
+        for base_table in unique_base_tables:
+            file_parts = _discover_table_files(year, month, forecast_type, base_table)
+            expanded_tables.extend(file_parts)
+        return sorted(list(set(expanded_tables)))
+
+    return unique_base_tables
 
 
 def get_sqlloader_years_and_months() -> Dict[int, List[int]]:
@@ -338,8 +457,8 @@ def get_unzipped_csv(url: str, raw_cache: Path) -> None:
     z = ZipFile(file_path)
     if (
         len(csvfn := z.namelist()) == 1
-        and (zfn := match(".*DATA/(.*).zip", url))
         and (fn := match("(.*).[cC][sS][vV]", csvfn.pop()))
+        and (zfn := match(r".*DATA/(.*?)\.zip", unquote(url)))
         and (fn.group(1) == zfn.group(1))
     ):
         try:
@@ -409,17 +528,33 @@ class ForecastTypeDownloader:
         """Constructor method for :class:`ForecastTypeDownloader` from
         :class:`Query <nemseer.query.Query>`"""
         tables = query.tables
+
+        # Handle enumerated tables (old format)
         for ftype in ENUMERATED_TABLES:
             if query.forecast_type == ftype:
                 for table, enumerate_to in ENUMERATED_TABLES[ftype]:
                     if table in tables:
                         tables = _enumerate_tables(tables, table, enumerate_to)
 
+        # Handle new format file discovery
+        expanded_tables = []
+        for table in tables:
+            if "#FILE" not in table:  # Base table name
+                file_parts = _discover_table_files(
+                    query.run_start.year,
+                    query.run_start.month,
+                    query.forecast_type,
+                    table,
+                )
+                expanded_tables.extend(file_parts)
+            else:  # Already has FILE# suffix
+                expanded_tables.append(table)
+
         return cls(
             run_start=query.run_start,
             run_end=query.run_end,
             forecast_type=query.forecast_type,
-            tables=tables,
+            tables=expanded_tables,
             raw_cache=query.raw_cache,
         )
 

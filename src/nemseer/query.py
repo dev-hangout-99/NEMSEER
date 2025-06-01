@@ -117,10 +117,15 @@ def _enumerate_tables(tables: List[str], table_str: str, range_to: int) -> List[
     return tables
 
 
+def _use_new_filename_format(year: int, month: int) -> bool:
+    """Determines whether to use new filename format based on date"""
+    return (year, month) >= (2024, 8)
+
+
 def _construct_sqlloader_filename(
     year: int, month: int, forecast_type: str, table: str
 ) -> str:
-    """Constructs filename without file type
+    """Constructs filename without file type for old format
 
     Args:
         year: Year
@@ -137,6 +142,47 @@ def _construct_sqlloader_filename(
         prefix = f"PUBLIC_DVD_{forecast_type}_{table}"
     fn = prefix + f"_{stryear}{strmonth}010000"
     return fn
+
+
+def _construct_new_sqlloader_filename(
+    year: int, month: int, forecast_type: str, table: str
+) -> str:
+    """
+    Constructs a SQLLoader filename (without ".zip") for the new PUBLIC_ARCHIVE format.
+    Assumes `table` may contain the "#FILE##" suffix (e.g. "CONSTRAINTSOLUTION#FILE02").
+    Preserves the PREDISPATCH underscore rule:
+      - If forecast_type == "PREDISPATCH" and base_table != "MNSPBIDTRK", no underscore
+      - Otherwise, include an underscore between forecast_type and base_table
+
+    Args:
+        year: Year (e.g. 2025)
+        month: Month (1–12)
+        forecast_type: One of nemseer.forecast_types (e.g. "P5MIN", "PREDISPATCH")
+        table: Table name, may include FILE tag, e.g. "CONSTRAINTSOLUTION#FILE02"
+    Returns:
+        Filename string without ".zip", e.g.:
+        "PUBLIC_ARCHIVE#P5MIN_CONSTRAINTSOLUTION#FILE02#202501010000"
+    """
+    yyyy = str(year)
+    mm = str(month).rjust(2, "0")
+
+    # Check if table has #FILE## suffix
+    if "#FILE" in table:
+        # Split into base_table and the "#FILE##" suffix
+        base_table, file_suffix = table.split("#FILE", 1)
+        file_suffix = "#FILE" + file_suffix  # e.g. "#FILE02"
+    else:
+        # No file suffix
+        base_table = table
+        file_suffix = ""
+
+    # Apply the PREDISPATCH underscore logic
+    if forecast_type == "PREDISPATCH" and base_table != "MNSPBIDTRK":
+        prefix = f"PUBLIC_ARCHIVE#{forecast_type}{base_table}{file_suffix}"
+    else:
+        prefix = f"PUBLIC_ARCHIVE#{forecast_type}_{base_table}{file_suffix}"
+
+    return f"{prefix}#{yyyy}{mm}010000"
 
 
 def generate_sqlloader_filenames(
@@ -193,15 +239,24 @@ def generate_sqlloader_filenames(
     int_months = _determine_delta_months(run_start, run_end)
     intervening_dates = [run_start + x * MONTH for x in range(0, int_months + 1)]
     filename_data = {}
+
+    # Handle enumerated tables for old format
     for ftype in ENUMERATED_TABLES:
         if forecast_type == ftype:
             for table, enumerate_to in ENUMERATED_TABLES[ftype]:
                 if table in tables:
                     tables = _enumerate_tables(tables, table, enumerate_to)
+
     for table in tables:
         for date in intervening_dates:
             (year, month) = (date.year, date.month)
-            fname = _construct_sqlloader_filename(year, month, forecast_type, table)
+
+            if _use_new_filename_format(date.year, date.month):
+                fname = _construct_new_sqlloader_filename(
+                    year, month, forecast_type, table
+                )
+            else:
+                fname = _construct_sqlloader_filename(year, month, forecast_type, table)
             filename_data[(year, month, table)] = fname
     return filename_data
 
